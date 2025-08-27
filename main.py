@@ -5,9 +5,11 @@ import winreg  # 用于Windows文件关联
 from pathlib import Path
 from PySide6.QtGui import QIcon
 
-from PySide6.QtCore import Qt, QTimer, QRect, Signal, QPoint
-from PySide6.QtGui import (QPalette, QColor, QAction, QGuiApplication, QFont, 
-                          QPixmap, QPainter, QImage, QFontDatabase, QCursor)
+from PySide6.QtCore import Qt, QTimer, QRect, Signal, QPoint, QPointF
+from PySide6.QtGui import (
+    QPalette, QColor, QAction, QGuiApplication, QFont,
+    QPixmap, QPainter, QImage, QFontDatabase, QCursor, QFontMetrics
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QDockWidget, QListWidget, QTableWidget, QTableWidgetItem,
     QFileDialog, QLineEdit, QMessageBox, QVBoxLayout, QWidget, QMenuBar, QMenu,
@@ -136,107 +138,164 @@ class FontTextureGenerator:
             f.write(html_content)
 
 class ImageViewer(QDialog):
-    """图片查看器对话框，支持缩放"""
+    """图片查看器对话框，支持滚轮缩放和鼠标拖动平移"""
     def __init__(self, pixmap, title="图片预览", parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.original_pixmap = pixmap
         self.scale_factor = 1.0
-        self.drag_position = QPoint()
-        
-        # 创建主部件
+
         self.image_label = QLabel()
-        self.image_label.setPixmap(pixmap)
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setScaledContents(False)
-        
-        # 滚动区域
+        self.image_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+
         self.scroll_area = QScrollArea()
+        self.scroll_area.setBackgroundRole(QPalette.ColorRole.Dark)
         self.scroll_area.setWidget(self.image_label)
         self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.scroll_area.setWidgetResizable(True)
-        
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.scroll_area)
-        
-        # 初始缩放以适应窗口
-        self.fit_to_window()
-        
+
+        self.scroll_area.setWidgetResizable(False)
+        self.scroll_area.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+        self.is_panning = False
+        self.last_mouse_pos = QPoint()
+
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(self.scroll_area)
+        self.setLayout(main_layout)
+
+        # 安装 eventFilter：现在会拦截包括 Wheel 的事件
+        self.scroll_area.viewport().installEventFilter(self)
+
+        # 以1:1的比例加载图片，并设置窗口大小
+        self.update_image_scale()
+        self.resize(2048, 2048)
+
     def fit_to_window(self):
-        """初始缩放以适应窗口"""
-        if not self.original_pixmap.isNull():
-            # 计算适合窗口的缩放比例
-            screen_size = QGuiApplication.primaryScreen().availableGeometry()
-            max_width = int(screen_size.width() * 0.8)
-            max_height = int(screen_size.height() * 0.8)
-            
-            pixmap_size = self.original_pixmap.size()
-            width_ratio = max_width / pixmap_size.width()
-            height_ratio = max_height / pixmap_size.height()
-            
-            # 取最小比例，确保完整显示
-            self.scale_factor = min(width_ratio, height_ratio, 1.0)
-            self.update_image()
-            
-            # 调整窗口大小
-            new_width = min(pixmap_size.width() * self.scale_factor, max_width)
-            new_height = min(pixmap_size.height() * self.scale_factor, max_height)
-            self.resize(int(new_width), int(new_height))
-    
-    def wheelEvent(self, event):
-        # 缩放因子
-        zoom_factor = 1.1
+        if self.original_pixmap.isNull() or self.original_pixmap.width() == 0 or self.original_pixmap.height() == 0:
+            return
+
+        area_size = self.scroll_area.viewport().size()
+        pixmap_size = self.original_pixmap.size()
+
+        w_ratio = area_size.width() / pixmap_size.width()
+        h_ratio = area_size.height() / pixmap_size.height()
+
+        self.scale_factor = min(w_ratio, h_ratio)
+        self.update_image_scale()
+
+    def update_image_scale(self):
+        if self.original_pixmap.isNull():
+            return
+
+        new_size = self.original_pixmap.size() * self.scale_factor
         
-        # 检查Ctrl键是否按下
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            # 保存旧的位置
-            old_pos = self.scroll_area.mapFromGlobal(QCursor.pos())
-            
-            # 计算缩放
-            if event.angleDelta().y() > 0:
-                # 放大
-                self.scale_factor *= zoom_factor
-            else:
-                # 缩小
-                self.scale_factor /= zoom_factor
-                # 最小缩放限制
-                if self.scale_factor < 0.1:
-                    self.scale_factor = 0.1
-                    
-            # 设置新的大小
-            self.update_image()
-            
-            # 调整滚动条以保持鼠标下的位置不变
-            new_pos = old_pos * self.scale_factor
-            self.scroll_area.horizontalScrollBar().setValue(int(new_pos.x() - self.scroll_area.width()/2 + self.scroll_area.horizontalScrollBar().value()))
-            self.scroll_area.verticalScrollBar().setValue(int(new_pos.y() - self.scroll_area.height()/2 + self.scroll_area.verticalScrollBar().value()))
-            
+        # 使用SmoothTransformation以获得更好的缩放质量
+        scaled_pixmap = self.original_pixmap.scaled(
+            new_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        self.image_label.setPixmap(scaled_pixmap)
+        self.image_label.resize(new_size)
+
+    # --- 新增：统一缩放处理（以 pointer 为中心） ---
+    def _perform_zoom_at(self, delta_y, point_under_cursor):
+        """delta_y: angleDelta().y()（>0 放大, <0 缩小）
+           point_under_cursor: QPoint（相对于 scroll_area.viewport() 的局部坐标）"""
+        if delta_y == 0:
+            return
+
+        zoom_in_factor = 1.15
+        zoom_out_factor = 1 / 1.15
+        old_scale = self.scale_factor
+        factor = zoom_in_factor if delta_y > 0 else zoom_out_factor
+
+        # 计算在 image label 上的坐标（浮点）
+        h = self.scroll_area.horizontalScrollBar().value()
+        v = self.scroll_area.verticalScrollBar().value()
+        pos_on_label = QPointF(point_under_cursor.x() + h, point_under_cursor.y() + v)
+
+        # 转换为“图像坐标系”（相对于当前缩放）
+        if old_scale != 0:
+            pos_on_label /= old_scale
+
+        # 缩放并限定范围
+        MIN_SCALE = 0.05
+        MAX_SCALE = 8.0
+        self.scale_factor = max(MIN_SCALE, min(MAX_SCALE, self.scale_factor * factor))
+
+        # 更新显示
+        self.update_image_scale()
+
+        # 计算新的滚动位置，保持指针处内容不动
+        new_pos_on_label = pos_on_label * self.scale_factor
+        new_scrollbar_x = new_pos_on_label.x() - point_under_cursor.x()
+        new_scrollbar_y = new_pos_on_label.y() - point_under_cursor.y()
+
+        self.scroll_area.horizontalScrollBar().setValue(int(new_scrollbar_x))
+        self.scroll_area.verticalScrollBar().setValue(int(new_scrollbar_y))
+
+    # --- 修改：在 viewport 的 eventFilter 中拦截 Wheel（并保持原来的 panning） ---
+    def eventFilter(self, source, event):
+        if source == self.scroll_area.viewport():
+            # 1) 处理鼠标按下 / 拖动（平移）
+            if event.type() == event.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self.is_panning = True
+                self.last_mouse_pos = event.globalPosition().toPoint()
+                self.scroll_area.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+                return True
+            elif event.type() == event.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                self.is_panning = False
+                self.scroll_area.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+                return True
+            elif event.type() == event.Type.MouseMove and self.is_panning:
+                delta = event.globalPosition().toPoint() - self.last_mouse_pos
+                self.last_mouse_pos = event.globalPosition().toPoint()
+                self.scroll_area.horizontalScrollBar().setValue(self.scroll_area.horizontalScrollBar().value() - delta.x())
+                self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().value() - delta.y())
+                return True
+
+            # 2) **拦截并处理滚轮（关键修复）**
+            elif event.type() == event.Type.Wheel:
+                # 优先使用 angleDelta（常见鼠标），否则使用 pixelDelta（触控板高精度）
+                delta_y = 0
+                try:
+                    # PySide6 中常用
+                    delta = event.angleDelta()
+                    if not delta.isNull():
+                        delta_y = delta.y()
+                    else:
+                        delta_y = event.pixelDelta().y()
+                except Exception:
+                    # 兜底
+                    delta_y = event.angleDelta().y() if hasattr(event, 'angleDelta') else 0
+
+                # 获取局部坐标（viewport 坐标）
+                if hasattr(event, 'position'):
+                    local_pt = event.position().toPoint()
+                else:
+                    local_pt = event.pos()
+
+                # 调用统一的缩放处理，并阻止进一步传播（防止 QScrollArea 默认滚动）
+                self._perform_zoom_at(delta_y, local_pt)
+                event.accept()
+                return True
+
+        return super().eventFilter(source, event)
+
+    # 如果 wheelEvent 落在 dialog 的其它部分（不是 viewport），也使用同样的处理（兼容性）
+    def wheelEvent(self, event):
+        try:
+            delta_y = event.angleDelta().y() if hasattr(event, 'angleDelta') else 0
+        except Exception:
+            delta_y = 0
+        # 根据全局光标映射到 viewport 局部坐标
+        point_under_cursor = self.scroll_area.mapFromGlobal(QCursor.pos())
+        if delta_y != 0:
+            self._perform_zoom_at(delta_y, point_under_cursor)
             event.accept()
         else:
-            # 没有Ctrl键，执行默认的滚动行为
             super().wheelEvent(event)
-    
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-    
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self.drag_position)
-            event.accept()
-    
-    def update_image(self):
-        """根据缩放因子更新图像"""
-        if not self.original_pixmap.isNull():
-            new_size = self.original_pixmap.size() * self.scale_factor
-            scaled_pixmap = self.original_pixmap.scaled(
-                new_size, 
-                Qt.AspectRatioMode.KeepAspectRatio, 
-                Qt.TransformationMode.SmoothTransformation
-            )
-            self.image_label.setPixmap(scaled_pixmap)
-            self.image_label.resize(new_size)
 
 class ClickableLabel(QLabel):
     """可点击的QLabel"""
@@ -302,6 +361,35 @@ class FontSelectionWidget(QWidget):
 
     def get_font(self):
         return self.font
+
+class CharacterInputDialog(QDialog):
+    """自定义字符输入对话框，支持64字符固定宽度换行"""
+    def __init__(self, parent=None, initial_text=""):
+        super().__init__(parent)
+        self.setWindowTitle("输入字符")
+        self.setMinimumSize(520, 400)
+
+        layout = QVBoxLayout(self)
+        label = QLabel("请输入需要生成的字符 (可粘贴):")
+        layout.addWidget(label)
+
+        self.text_edit = QTextEdit()
+        font = QFont("Consolas", 12)
+        fm = QFontMetrics(font)
+        # 使用 'W' 作为基准，因为它通常是monospace字体中最宽的字符之一
+        pixel_width = fm.horizontalAdvance('W') * 64
+        
+        self.text_edit.setFont(font)
+        self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.FixedPixelWidth)
+        self.text_edit.setLineWrapColumnOrWidth(pixel_width)
+        self.text_edit.setPlainText(initial_text)
+
+        layout.addWidget(self.text_edit, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
 class FontGeneratorDialog(QDialog):
     """最终版字体贴图生成器对话框"""
@@ -422,7 +510,13 @@ class FontGeneratorDialog(QDialog):
 
     def show_full_preview(self, label):
         if label.pixmap_cache and not label.pixmap_cache.isNull():
-            viewer = ImageViewer(label.pixmap_cache, label.parent().findChild(QLabel).text(), self)
+            # 将原始贴图高质量缩放到2048x2048，用于1:1预览
+            viewing_pixmap = label.pixmap_cache.scaled(
+                2048, 2048,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            viewer = ImageViewer(viewing_pixmap, label.parent().findChild(QLabel).text(), self)
             viewer.exec()
 
     def update_ui_for_version(self):
@@ -490,20 +584,17 @@ class FontGeneratorDialog(QDialog):
 
     def input_chars_manually(self):
         """手动输入字符"""
-        text, ok = QInputDialog.getMultiLineText(
-            self, 
-            "输入字符", 
-            "请输入需要生成的字符 (可粘贴):", 
-            self.characters
-        )
-        if ok and text:
-            # 移除换行和空格
-            chars = text.replace("\n", "").replace(" ", "")
-            # 去重
-            unique_chars = "".join(dict.fromkeys(chars))
-            self.characters = unique_chars
-            self.update_char_count()
-            QMessageBox.information(self, "成功", f"已设置 {len(unique_chars)} 个字符")
+        dlg = CharacterInputDialog(self, self.characters)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            text = dlg.text_edit.toPlainText()
+            if text:
+                # 移除换行和空格
+                chars = text.replace("\n", "").replace(" ", "")
+                # 去重
+                unique_chars = "".join(dict.fromkeys(chars))
+                self.characters = unique_chars
+                self.update_char_count()
+                QMessageBox.information(self, "成功", f"已设置 {len(unique_chars)} 个字符")
 
     def show_chars_list(self):
         """显示字符列表对话框"""
@@ -513,25 +604,29 @@ class FontGeneratorDialog(QDialog):
             
         dlg = QDialog(self)
         dlg.setWindowTitle("字符列表")
-        dlg.resize(400, 300)
+        dlg.setMinimumSize(520, 400)
         
         layout = QVBoxLayout(dlg)
         
-        # 字符列表显示 - 设置自动换行
         text_edit = QTextEdit()
-        text_edit.setPlainText(self.characters)
         text_edit.setReadOnly(True)
-        text_edit.setFont(QFont("Consolas", 12))
-        text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)  # 自动换行
+        
+        font = QFont("Consolas", 12)
+        fm = QFontMetrics(font)
+        pixel_width = fm.horizontalAdvance('W') * 64
+        
+        text_edit.setFont(font)
+        text_edit.setLineWrapMode(QTextEdit.LineWrapMode.FixedPixelWidth)
+        text_edit.setLineWrapColumnOrWidth(pixel_width)
+        text_edit.setPlainText(self.characters)
+        
         layout.addWidget(text_edit)
         
-        # 字符统计信息
         char_count = len(self.characters)
         unique_count = len(set(self.characters))
         info_label = QLabel(f"字符总数: {char_count} | 唯一字符数: {unique_count}")
         layout.addWidget(info_label)
         
-        # 关闭按钮
         btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btn_box.rejected.connect(dlg.reject)
         layout.addWidget(btn_box)
@@ -1058,34 +1153,32 @@ class GXTEditorApp(QMainWindow):
         """显示右键菜单"""
         if not self.current_table:
             return
-            
+
         menu = QMenu()
-        
-        # 获取选中的行
         selected_rows = self.table.selectionModel().selectedRows()
-        
-        # 只在选中单个行时显示编辑按钮
+
+        if not selected_rows:
+            return
+
+        # 根据选中数量，将“编辑”或“批量编辑”放在首位
         if len(selected_rows) == 1:
             edit_action = QAction("✏️ 编辑", self)
             edit_action.triggered.connect(self.on_table_double_click)
             menu.addAction(edit_action)
-        
-        # 添加删除操作
-        delete_action = QAction("🗑️ 删除", self)
-        delete_action.triggered.connect(self.delete_key)
-        menu.addAction(delete_action)
-        
-        # 添加复制操作
-        copy_action = QAction("📋 复制", self)
-        copy_action.triggered.connect(self.copy_selected)
-        menu.addAction(copy_action)
-        
-        # 如果有多个选中项，添加批量编辑操作
-        if len(selected_rows) > 1:
+        else:  # > 1
             batch_edit_action = QAction("✏️ 批量编辑", self)
             batch_edit_action.triggered.connect(self.batch_edit_selected)
             menu.addAction(batch_edit_action)
-        
+
+        # 添加通用操作
+        delete_action = QAction("🗑️ 删除", self)
+        delete_action.triggered.connect(self.delete_key)
+        menu.addAction(delete_action)
+
+        copy_action = QAction("📋 复制", self)
+        copy_action.triggered.connect(self.copy_selected)
+        menu.addAction(copy_action)
+
         # 显示菜单
         menu.exec(self.table.viewport().mapToGlobal(position))
 
@@ -1473,10 +1566,19 @@ class GXTEditorApp(QMainWindow):
                 if self.version == 'III':
                     QMessageBox.warning(self, "提示", "GTA III GXT 文件不支持导出为多个TXT。")
                     return
+                
+                # 让用户选择一个父目录
+                parent_dir = QFileDialog.getExistingDirectory(self, "请选择保存导出文件夹的位置")
+                if not parent_dir:
+                    return
+
+                # 让用户输入新文件夹的名称
                 default_dirname = {'IV': 'GTA4_txt', 'VC': 'GTAVC_txt', 'SA': 'GTASA_txt'}.get(self.version, "gxt_export")
-                base_name, ok = QInputDialog.getText(self, "导出多个TXT", "请输入导出目录名称：", text=default_dirname)
+                base_name, ok = QInputDialog.getText(self, "导出多个TXT", "请输入导出文件夹的名称：", text=default_dirname)
                 if not ok or not base_name.strip(): return
-                export_dir = os.path.join(os.path.dirname(self.filepath) if self.filepath else os.getcwd(), base_name.strip())
+                
+                export_dir = os.path.join(parent_dir, base_name.strip())
+                
                 if os.path.exists(export_dir):
                     if QMessageBox.question(self, "确认", f"目录 '{export_dir}' 已存在，是否覆盖？") != QMessageBox.StandardButton.Yes: return
                     shutil.rmtree(export_dir)
